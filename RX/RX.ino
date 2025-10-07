@@ -1,87 +1,128 @@
-// ESP32-C3 SuperMini — BASE UNIT (RX)
-// ESP-NOW receiver -> Pan/Tilt servos using ESP32Servo (works on ESP32/C3/S2/S3)
-
+// === RX: ESP32-C3 SuperMini -> ESP-NOW -> PAN/TILT servos ===
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <esp_now.h>
 #include <ESP32Servo.h>
 
-#define SERVO_PAN_PIN   4   // If Serial conflicts, enable USB CDC On Boot or move pins
-#define SERVO_TILT_PIN  5
+#define WIFI_CHANNEL        1
+#define SERVO_PAN_PIN       4
+#define SERVO_TILT_PIN      5
+#define SERVO_MIN_US        1000
+#define SERVO_MAX_US        2000
+#define SERVO_FREQ_HZ       50
+#define PAN_INVERT          0
+#define TILT_INVERT         0
+#define SMOOTH_ALPHA        0.35f
+#define FAILSAFE_MS         250
+#define LED_PIN             2
 
-struct Packet {
-  float yaw_deg;
-  float pitch_deg;
-};
+typedef struct __attribute__((packed)) {
+  uint32_t seq;
+  int16_t yaw_deg;
+  int16_t pitch_deg;
+} HeadPkt;
 
 Servo servoPan, servoTilt;
-volatile Packet latest{};
-volatile uint32_t lastMs = 0;
+volatile unsigned long lastRxMs = 0;
+volatile HeadPkt lastPkt{};          // keep as volatile; write via memcpy
+float filtPanDeg = 0.0f, filtTiltDeg = 0.0f;
 
-static inline int mapf_to_int(float v, float in_min, float in_max, int out_min, int out_max) {
-  if (v < in_min) v = in_min;
-  if (v > in_max) v = in_max;
-  return (int)(out_min + (v - in_min) * (out_max - out_min) / (in_max - in_min));
+static inline int degToServoAngle(float deg, bool invert) {
+  if (deg > 90) deg = 90;
+  if (deg < -90) deg = -90;
+  if (invert) deg = -deg;
+  float angle = (deg + 90.0f);
+  if (angle < 0) angle = 0;
+  if (angle > 180) angle = 180;
+  return (int)lroundf(angle);
 }
 
-// NEW signature for ESP-NOW recv callback in recent ESP-IDF/Arduino-ESP32
-void onRecv(const esp_now_recv_info* info, const uint8_t* incomingData, int len) {
-  if (len == sizeof(Packet)) {
-    memcpy((void*)&latest, incomingData, sizeof(Packet)); // copy into volatile
-    lastMs = millis();
-  }
+// NEW callback signature on IDF v5.x:
+void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len != sizeof(HeadPkt)) return;
+
+  // Copy into volatile safely
+  HeadPkt pkt;
+  memcpy(&pkt, data, sizeof(pkt));
+  memcpy((void*)&lastPkt, &pkt, sizeof(pkt));   // write to volatile via memcpy
+
+  lastRxMs = millis();
+
+  // (Optional) If you want the sender MAC, it’s in info->src_addr (6 bytes)
+  // const uint8_t* mac = info->src_addr;
+}
+
+void centerServos() {
+  servoPan.writeMicroseconds((SERVO_MIN_US + SERVO_MAX_US)/2);
+  servoTilt.writeMicroseconds((SERVO_MIN_US + SERVO_MAX_US)/2);
 }
 
 void setup() {
-  // Tip: Tools -> USB CDC On Boot: Enabled (so Serial uses USB, freeing GPIO1)
   Serial.begin(115200);
   delay(100);
 
-  // (Optional) allocate all 4 PWM timers up-front to avoid conflicts
-  ESP32PWM::allocateTimer(0);
-  ESP32PWM::allocateTimer(1);
-  ESP32PWM::allocateTimer(2);
-  ESP32PWM::allocateTimer(3);
-
-  // Set 50 Hz per instance (or omit: default is 50 Hz)
-  servoPan.setPeriodHertz(50);
-  servoTilt.setPeriodHertz(50);
-
-  // Attach with safe pulse limits
-  servoPan.attach(SERVO_PAN_PIN, 1000, 2000);
-  servoTilt.attach(SERVO_TILT_PIN, 1000, 2000);
-  servoPan.write(90);
-  servoTilt.write(90);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
 
   WiFi.mode(WIFI_STA);
-  Serial.print("Receiver MAC: "); Serial.println(WiFi.macAddress());
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
 
   if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW init failed!");
-    while (true) delay(10);
+    Serial.println("ESP-NOW init failed");
+    while (1) delay(10);
   }
+
+  // Register the NEW-style callback
   esp_now_register_recv_cb(onRecv);
 
-  Serial.println("RX ready (ESP-NOW + ESP32Servo)");
+  servoPan.setPeriodHertz(SERVO_FREQ_HZ);
+  servoTilt.setPeriodHertz(SERVO_FREQ_HZ);
+  servoPan.attach(SERVO_PAN_PIN, SERVO_MIN_US, SERVO_MAX_US);
+  servoTilt.attach(SERVO_TILT_PIN, SERVO_MIN_US, SERVO_MAX_US);
+
+  centerServos();
+  lastRxMs = millis();
+
+  Serial.println("RX ready (listening for broadcast)...");
 }
 
 void loop() {
-  // Copy from volatile safely into a local (non-volatile) Packet
-  Packet p;
-  memcpy(&p, (const void*)&latest, sizeof(Packet));
+  unsigned long now = millis();
+  bool link = (now - lastRxMs) < FAILSAFE_MS;
 
-  // Map: yaw -90..+90 -> pan 0..180
-  //      pitch -45..+45 -> tilt 30..150
-  int panDeg  = mapf_to_int(p.yaw_deg,   -90.0f, +90.0f, 0,   180);
-  int tiltDeg = mapf_to_int(p.pitch_deg, -45.0f, +45.0f, 30,  150);
+  if (!link) {
+    digitalWrite(LED_PIN, (now/250)%2);   // blink when link lost
+    centerServos();
+    delay(10);
+    return;
+  } else {
+    digitalWrite(LED_PIN, HIGH);          // solid when link good
+  }
 
-  servoPan.write(panDeg);
-  servoTilt.write(tiltDeg);
+  // Read the latest volatile packet into a local copy once per loop
+  HeadPkt pkt;
+  memcpy(&pkt, (const void*)&lastPkt, sizeof(pkt));
 
-  // Failsafe if no packets for 700 ms
-  if (millis() - lastMs > 700) {
-    servoPan.write(90);
-    servoTilt.write(90);
+  float targetPanDeg  = (float)pkt.yaw_deg;
+  float targetTiltDeg = (float)pkt.pitch_deg;
+
+  filtPanDeg  = SMOOTH_ALPHA * targetPanDeg  + (1.0f - SMOOTH_ALPHA) * filtPanDeg;
+  filtTiltDeg = SMOOTH_ALPHA * targetTiltDeg + (1.0f - SMOOTH_ALPHA) * filtTiltDeg;
+
+  int panAngle  = degToServoAngle(filtPanDeg,  PAN_INVERT);
+  int tiltAngle = degToServoAngle(filtTiltDeg, TILT_INVERT);
+
+  servoPan.write(panAngle);
+  servoTilt.write(tiltAngle);
+
+  static uint32_t t = 0;
+  if (now - t > 50) {
+    t = now;
+    Serial.printf("seq:%lu yaw:%d pitch:%d | pan:%d tilt:%d\n",
+      (unsigned long)pkt.seq, (int)pkt.yaw_deg, (int)pkt.pitch_deg, panAngle, tiltAngle);
   }
 
   delay(5);
